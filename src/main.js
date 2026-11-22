@@ -22,7 +22,9 @@ const QUALITY = {
   high: { N: 512, rings: 1100, sectors: 800, dpr: 2, msaa: 4, shadow: 4096, half: 0.5 },
   ultra: { N: 512, rings: 1600, sectors: 1100, dpr: 2, msaa: 8, shadow: 4096, half: 1 },
 };
-const qualityName = QUALITY[query.get('q')] ? query.get('q') : 'high';
+// Phones and tablets start on the light preset; desktops on high. `?q=` overrides both.
+const defaultQuality = window.matchMedia('(pointer: coarse)').matches ? 'low' : 'high';
+const qualityName = QUALITY[query.get('q')] ? query.get('q') : defaultQuality;
 const Q = QUALITY[qualityName];
 
 const SKIES = {
