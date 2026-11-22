@@ -167,8 +167,14 @@ async function init() {
     envRT = buildEnvironment(renderer, sky, rot, sea);
     scene.environment = envRT.texture;
   };
+  let skyRequest = 0;
   const setSky = async (name) => {
-    if (!skyCache[name]) skyCache[name] = await loadSky(`assets/sky/${SKIES[name].file}`);
+    const request = ++skyRequest;
+    if (!skyCache[name]) {
+      const loaded = await loadSky(`assets/sky/${SKIES[name].file}`);
+      skyCache[name] ??= loaded;
+    }
+    if (request !== skyRequest) return;
     sky = skyCache[name];
     params.exposure = SKIES[name].exposure;
     renderer.toneMappingExposure = params.exposure;
@@ -321,8 +327,22 @@ async function init() {
     { id: 'rain', label: 'Rain', value: params.rain > 0, onChange: (v) => { params.rain = v ? 1 : 0; applyWeather(); } },
     { id: 'sound', label: 'Sound', title: 'Sea, wind and rain ambience', value: false, onChange: (v) => { params.sound = v; ambience.setEnabled(v); } },
     { id: 'follow', label: 'Camera turns with ship', value: params.follow, onChange: (v) => { params.follow = v; } },
-    { id: 'gui', label: 'Fine tuning', title: 'Wind, swell, foam, exposure, quality', value: false, onChange: (v) => { if (v) { gui.show(); gui.open(); } else gui.hide(); } },
+    { id: 'gui', label: 'Fine tuning', title: 'Wind, swell, foam, exposure, quality', value: false, onChange: (v) => { if (v) { gui.show(); gui.open(); } else gui.hide(); placeGui(); } },
   ]);
+  // On narrow screens the fine-tuning panel goes under the main panel instead of on top of it.
+  const placeGui = () => {
+    const st = gui.domElement.style;
+    if (window.innerWidth < 820) {
+      const top = panel.root.getBoundingClientRect().bottom + 8;
+      const room = window.innerHeight - top - hud.root.getBoundingClientRect().height - 28;
+      st.setProperty('top', `${room >= 110 ? top : 14}px`, 'important');
+      st.maxHeight = `${room >= 110 ? room : window.innerHeight - 28}px`;
+    } else {
+      st.removeProperty('top');
+      st.maxHeight = '';
+    }
+  };
+  window.addEventListener('resize', placeGui);
 
   const typing = (e) => e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') && e.target.type !== 'range';
   const held = { left: false, right: false };
