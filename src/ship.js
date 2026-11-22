@@ -13,6 +13,12 @@ export class Ship {
     this.position = new THREE.Vector2(0, 0);
     this.heading = 0;
     this.speed = 3.2;
+    this.maxSpeed = 5;
+    this.throttle = 0.65;   // how much sail is set, 0..1
+    this.rudderInput = 0;   // -1 port .. +1 starboard, from the helm
+    this.rudder = 0;
+    this.yawRate = 0;
+    this.lamps = 0;
     this.draft = -0.45;
     this.heel = 0.045;
     this.heave = 0; this.pitch = 0; this.roll = 0;
@@ -22,7 +28,8 @@ export class Ship {
     this.hullTex = null;
     this.inverse = new THREE.Matrix4();
     this.initialised = false;
-    this.sunUniforms = { uSunDirW: { value: new THREE.Vector3(0, 1, 0) }, uSunCol: { value: new THREE.Vector3() } };
+    this._v = new THREE.Vector3();
+    this.sunUniforms = { uSunDirW: { value: new THREE.Vector3(0, 1, 0) }, uSunCol: { value: new THREE.Vector3() }, uSailTime: { value: 0 } };
   }
 
   async load(url, renderer, onProgress) {
@@ -45,6 +52,12 @@ export class Ship {
         // canvas is translucent: sunlight hitting the far side glows through
         m.onBeforeCompile = (shader) => {
           Object.assign(shader.uniforms, this.sunUniforms);
+          // the canvas is never perfectly still
+          shader.vertexShader = shader.vertexShader
+            .replace('#include <common>', '#include <common>\nuniform float uSailTime;')
+            .replace('#include <begin_vertex>', `#include <begin_vertex>
+              transformed += objectNormal * (sin(position.y * 1.1 + position.z * 0.7 + uSailTime * 2.1) * 0.035
+                + sin(position.x * 2.3 + position.y * 0.5 - uSailTime * 3.4) * 0.018);`);
           shader.fragmentShader = shader.fragmentShader
             .replace('#include <common>', '#include <common>\nuniform vec3 uSunDirW, uSunCol;')
             .replace('#include <aomap_fragment>', `{
@@ -60,6 +73,7 @@ export class Ship {
     this.model = model;
     this.group.add(model);
     this._buildHullOutline();
+    this._buildLanterns();
     return this;
   }
 
@@ -102,6 +116,55 @@ export class Ship {
     this.hull.set(z0, z1, HULL_LUT, 1);
   }
 
+  /** Stern lanterns: a warm glow and a little light on the deck, lit when the sky is dim. */
+  _buildLanterns() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.12, 'rgba(255,214,150,0.85)');
+    grad.addColorStop(0.4, 'rgba(255,150,60,0.18)');
+    grad.addColorStop(1, 'rgba(255,120,40,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 128, 128);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    this.lanterns = [];
+    for (const x of [-1.75, 1.75]) {
+      const mat = new THREE.SpriteMaterial({ map: tex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true });
+      const glow = new THREE.Sprite(mat);
+      glow.scale.setScalar(1.5);
+      glow.position.set(x, 9.55, -17.47);
+      glow.userData.home = glow.position.clone();
+      const light = new THREE.PointLight(0xffa24a, 0, 16, 2);
+      light.position.set(x * 0.9, 9.6, -17.0);
+      this.group.add(glow, light);
+      this.lanterns.push({ glow, light });
+    }
+    this.setLamps(0, 1);
+  }
+
+  /** Keep each glow just in front of its lantern as seen from the camera, so the lamp body does not cover it. */
+  faceLamps(camera) {
+    if (!this.lanterns || this.lamps <= 0.01) return;
+    const c = this._v.copy(camera.position).applyMatrix4(this.inverse);
+    for (const { glow } of this.lanterns) {
+      const h = glow.userData.home;
+      glow.position.copy(c).sub(h).normalize().multiplyScalar(0.42).add(h);
+    }
+  }
+
+  setLamps(amount, exposure) {
+    this.lamps = amount;
+    if (!this.lanterns) return;
+    for (const { glow, light } of this.lanterns) {
+      glow.visible = amount > 0.01;
+      glow.material.color.setScalar((9 * amount) / exposure);
+      light.intensity = (36 * amount) / exposure;
+    }
+  }
+
   get forward() {
     return new THREE.Vector2(Math.sin(this.heading), Math.cos(this.heading)).multiplyScalar(this.forwardSign);
   }
@@ -117,6 +180,13 @@ export class Ship {
   }
 
   update(dt, sim) {
+    // helm: sail area sets the speed, the rudder turns the ship once she has way on
+    this.rudder += (this.rudderInput - this.rudder) * Math.min(1, dt * 1.5);
+    const target = this.throttle * this.maxSpeed * (1 - 0.22 * Math.abs(this.rudder));
+    this.speed += (target - this.speed) * Math.min(1, dt / (target > this.speed ? 6 : 9));
+    this.yawRate = this.rudder * 0.085 * Math.min(this.speed / 2.5, 1.4); // rad/s, positive to starboard
+    this.heading -= this.yawRate * dt * this.forwardSign;
+    this.sunUniforms.uSailTime.value += dt;
     const f = this.forward;
     this.position.addScaledVector(f, this.speed * dt);
 
@@ -128,7 +198,7 @@ export class Ship {
     }
     a /= i; bx /= sxx; bz /= szz;
     const tHeave = a + this.draft;
-    const tRoll = Math.atan(bx) * 0.85 + this.heel;
+    const tRoll = Math.atan(bx) * 0.85 + this.heel * (0.4 + 0.6 * this.throttle) - this.yawRate * this.speed * 0.2; // heels outward in a turn
     const tPitch = -Math.atan(bz) * 0.9;
     if (!this.initialised) {
       this.heave = tHeave; this.roll = tRoll; this.pitch = tPitch;

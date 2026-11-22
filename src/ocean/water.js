@@ -8,6 +8,35 @@ uniform sampler2D uD0, uD1, uD2, uD3;
 uniform sampler2D uS0, uS1, uS2, uS3;
 uniform vec4 uInvL;
 uniform float uN;
+uniform mat4 uShipInv;
+uniform vec4 uHull;
+uniform float uShipSpeed;
+
+// Waves made by the ship itself, stationary in the ship's frame: water piled up at the bow, the two
+// diverging Kelvin arms (19.5 degrees either side of the track) and transverse waves astern.
+float shipWave(vec2 p) {
+  if (uHull.w < 0.5 || uShipSpeed < 0.2) return 0.0;
+  vec3 lp = (uShipInv * vec4(p.x, 0.0, p.y, 1.0)).xyz;
+  float s = uHull.y - lp.z; // metres behind the bow
+  float x = abs(lp.x);
+  if (s < -8.0 || s > 150.0 || x > 70.0) return 0.0;
+  float v = uShipSpeed;
+  float amp = 0.15 * min(v * v / 10.0, 2.4);
+  float sp = max(s, 0.0);
+  float h = 1.5 * amp * exp(-((s - 1.0) * (s - 1.0) / 9.0 + x * x / 6.0));
+  float d = x - sp * 0.3536;
+  float wd = d > 0.0 ? 1.1 + 0.03 * sp : 2.2 + 0.11 * sp;
+  float c = v * 0.8165;
+  float k = 9.81 / (c * c);
+  h += amp * exp(-d * d / (wd * wd)) * cos(k * (x * 0.5774 - sp * 0.8165)) * smoothstep(0.0, 5.0, sp) / sqrt(1.0 + sp / 10.0);
+  float len = uHull.y - uHull.x;
+  float a = s - len;
+  if (a > 0.0) {
+    float wt = 1.6 + 0.26 * a;
+    h += 0.55 * amp * cos(9.81 / (v * v) * a) * exp(-x * x / (wt * wt)) * smoothstep(0.0, 4.0, a) / sqrt(1.0 + a / 14.0);
+  }
+  return h * smoothstep(150.0, 95.0, s);
+}
 `;
 
 const VERT = /* glsl */ `
@@ -28,6 +57,7 @@ void main() {
   vec3 d = textureLod(uD0, xz * uInvL.x, lod.x).xyz + textureLod(uD1, xz * uInvL.y, lod.y).xyz
          + textureLod(uD2, xz * uInvL.z, lod.z).xyz + textureLod(uD3, xz * uInvL.w, lod.w).xyz;
   vec3 wp = vec3(xz.x, 0.0, xz.y) + d;
+  wp.y += shipWave(xz);
   vXZ = xz;
   vWorld = wp;
   vec4 mv = viewMatrix * vec4(wp, 1.0);
@@ -46,13 +76,12 @@ out vec4 fragColor;
 
 uniform sampler2D uVarTex;
 uniform sampler2D uRefr, uRefrDepth, uRefl, uShadowMap, uWake, uFoamTex, uHullTex;
-uniform mat4 uReflMatrix, uShadowMatrix, uShipInv;
+uniform mat4 uReflMatrix, uShadowMatrix;
 uniform vec2 uResolution, uWakeOrigin;
-uniform vec4 uHull; // zStern, zBow, lut size, enabled
 uniform float uWakeSize, uNear, uFar, uTime, uHs, uShadowOn;
 uniform vec3 uSunDir, uSunColor, uSkyIrr;
 uniform vec3 uScatter, uSSSColor, uAbsorb, uBubbleColor;
-uniform float uFogDensity, uFoamAmount, uSSS, uSpecClamp, uReflOn, uRoughBoost;
+uniform float uFogDensity, uFoamAmount, uSSS, uSpecClamp, uReflOn, uRoughBoost, uRain;
 ${SKY_GLSL}
 
 const float PI = 3.14159265359;
@@ -141,9 +170,11 @@ void main() {
   float calm = clamp(wake.g, 0.0, 1.0);
   vec4 deriv = s0 + s1 + s2 * (1.0 - 0.55 * calm) + s3 * (1.0 - 0.85 * calm);
   vec2 slope = deriv.xy / max(1.0 + deriv.zw, vec2(0.25));
+  float sw = shipWave(vXZ);
+  slope += (vec2(shipWave(vXZ + vec2(0.2, 0.0)), shipWave(vXZ + vec2(0.0, 0.2))) - sw) * 5.0;
   vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
 
-  float sigma2 = lostVariance(footprint) * uRoughBoost + 2.0e-5;
+  float sigma2 = lostVariance(footprint) * uRoughBoost + 2.0e-5 + uRain * 0.0035; // rain pocks the surface
   float sigma = sqrt(sigma2);
   float NdotV = clamp(dot(N, V), 0.0, 1.0);
 
@@ -164,7 +195,14 @@ void main() {
     vec4 rc = uReflMatrix * vec4(vWorld.x + N.x * k, 0.0, vWorld.z + N.z * k, 1.0);
     vec2 ruv = rc.xy / rc.w;
     if (rc.w > 0.0 && ruv.x > 0.0 && ruv.x < 1.0 && ruv.y > 0.0 && ruv.y < 1.0) {
-      vec4 sr = textureLod(uRefl, ruv, clamp(log2(400.0 * sigma + 1.0), 1.0, 5.0));
+      // small waves smear a reflection along the line of sight: blur it and stretch it vertically
+      float rl = clamp(log2(400.0 * sigma + 1.0), 1.5, 5.0);
+      vec4 sr = vec4(0.0);
+      for (int i = 0; i < 5; i++) {
+        float f = float(i) - 2.0;
+        sr += textureLod(uRefl, ruv + vec2(0.0, f * 0.011), rl) * (1.0 - 0.3 * abs(f));
+      }
+      sr *= 0.9 / 3.2;
       refl = refl * (1.0 - sr.a) + sr.rgb;
     }
   }
@@ -347,7 +385,7 @@ export class Water {
       uBubbleColor: { value: new THREE.Color(0.06, 0.24, 0.26) },
       uAbsorb: { value: new THREE.Vector3(0.9, 0.32, 0.26) },
       uFogDensity: { value: 1 / 30000 }, uFoamAmount: { value: 1 }, uSSS: { value: 1 },
-      uSpecClamp: { value: 120 }, uRoughBoost: { value: 1 },
+      uSpecClamp: { value: 120 }, uRoughBoost: { value: 1 }, uRain: { value: 0 }, uShipSpeed: { value: 0 },
     };
     this.material = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3, vertexShader: VERT, fragmentShader: FRAG, uniforms: this.uniforms,
